@@ -482,6 +482,14 @@ namespace juce {
             initPluginExtension(pluginTimerSupport, CLAP_EXT_TIMER_SUPPORT);
             initPluginExtension(pluginPosixFdSupport, CLAP_EXT_POSIX_FD_SUPPORT);
             initPluginExtension(pluginState, CLAP_EXT_STATE);
+            // Spike 001 priority-3 (vst-l8ters Plan 03-04): register
+            // CLAP_EXT_NOTE_PORTS so hosted CLAP instruments can advertise
+            // their note input ports. Precursor to IO-03 MIDI routing to
+            // hosted CLAP instruments (MidiRouter in Plan 03-07 feeds
+            // clap_event_note events through the eventsIn buffer; the
+            // plugin needs this extension initialised for the routing to
+            // have a declared destination).
+            initPluginExtension(pluginNotePorts, CLAP_EXT_NOTE_PORTS);
 
             refreshParameterList();
 
@@ -596,6 +604,87 @@ namespace juce {
             eventsOut.clear();
             generatePluginInputEvents();
 
+            // Spike 001 priority-3 (vst-l8ters Plan 03-04): translate the
+            // incoming juce::MidiBuffer into CLAP note / midi events and push
+            // them into the plugin's input-event buffer for this block.
+            //
+            // Contract:
+            //   - NoteOn  -> CLAP_EVENT_NOTE_ON with velocity scaled to 0..1
+            //                (MIDI is 0..127; CLAP is 0..1 double).
+            //   - NoteOff -> CLAP_EVENT_NOTE_OFF with release velocity scaled.
+            //   - Other   -> CLAP_EVENT_MIDI with raw 3-byte payload
+            //                (pitchbend, CC, program change, aftertouch, etc.).
+            //
+            // Wildcard note addressing: port=0 / note_id=-1 for host-originated
+            // MIDI (no note-id tracking on the host side in v1). Channel + key
+            // come from the MIDI message itself. Matches CLAP's PCKN convention
+            // (clap/events.h lines 124-149).
+            //
+            // RT-safety (CLAUDE.md Invariant #1): the loop allocates only on
+            // the stack (POD event structs); juce::MidiBuffer::getNumEvents()
+            // and MidiBufferIterator are RT-safe; eventsIn.push() is a
+            // contiguous write into clap::helpers::EventList's arena. No
+            // audio-thread heap allocations or locks.
+            for (const auto meta : midiMessages)
+            {
+                const auto& m = meta.getMessage();
+                const uint32_t sampleOffset = (uint32_t) juce::jmax (0, meta.samplePosition);
+
+                if (m.isNoteOn())
+                {
+                    clap_event_note ev {};
+                    ev.header.size     = sizeof (ev);
+                    ev.header.time     = sampleOffset;
+                    ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                    ev.header.type     = CLAP_EVENT_NOTE_ON;
+                    ev.header.flags    = CLAP_EVENT_IS_LIVE;
+                    ev.note_id    = -1;  // host-originated; no note-id tracking in v1
+                    ev.port_index = 0;   // single host note-input port
+                    ev.channel    = (int16_t) juce::jmax (0, m.getChannel() - 1);  // JUCE 1..16 -> CLAP 0..15
+                    ev.key        = (int16_t) m.getNoteNumber();
+                    ev.velocity   = (double) m.getFloatVelocity();
+                    eventsIn.push (&ev.header);
+                }
+                else if (m.isNoteOff())
+                {
+                    clap_event_note ev {};
+                    ev.header.size     = sizeof (ev);
+                    ev.header.time     = sampleOffset;
+                    ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                    ev.header.type     = CLAP_EVENT_NOTE_OFF;
+                    ev.header.flags    = CLAP_EVENT_IS_LIVE;
+                    ev.note_id    = -1;
+                    ev.port_index = 0;
+                    ev.channel    = (int16_t) juce::jmax (0, m.getChannel() - 1);
+                    ev.key        = (int16_t) m.getNoteNumber();
+                    ev.velocity   = (double) m.getFloatVelocity();  // release velocity
+                    eventsIn.push (&ev.header);
+                }
+                else
+                {
+                    // Non-note MIDI (CC, pitch-bend, program change, aftertouch,
+                    // channel pressure). Forward as raw CLAP_EVENT_MIDI.
+                    // SysEx (>3 bytes) out-of-scope for priority-3 (see
+                    // CLAP_EVENT_MIDI_SYSEX acknowledgement in the output
+                    // switch above; full sysex routing is Plan 03-07 / IO-03).
+                    if (m.getRawDataSize() > 3)
+                        continue;
+                    clap_event_midi ev {};
+                    ev.header.size     = sizeof (ev);
+                    ev.header.time     = sampleOffset;
+                    ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+                    ev.header.type     = CLAP_EVENT_MIDI;
+                    ev.header.flags    = CLAP_EVENT_IS_LIVE;
+                    ev.port_index = 0;
+                    const auto* raw = m.getRawData();
+                    const int   n   = m.getRawDataSize();
+                    ev.data[0] = (n > 0) ? raw[0] : (uint8_t) 0;
+                    ev.data[1] = (n > 1) ? raw[1] : (uint8_t) 0;
+                    ev.data[2] = (n > 2) ? raw[2] : (uint8_t) 0;
+                    eventsIn.push (&ev.header);
+                }
+            }
+
             const auto status = plugin->process (plugin, &processState);
             ignoreUnused (status); // @TODO: figure out what to do with status
 
@@ -658,6 +747,86 @@ namespace juce {
                         v.has_value = true;
                         v.value = (float) ev->value;
                         pluginToHostParamQueue.setOrUpdate(ev->param_id, v);
+                        break;
+                    }
+
+                    // Spike 001 priority-3 (vst-l8ters Plan 03-04, ~150 LOC budget):
+                    // NOTE_ON / NOTE_OFF / NOTE_CHOKE / NOTE_END event cases.
+                    // The plugin emits these to tell the host "voice started"
+                    // (NOTE_ON echo — rare; most plugins only echo NOTE_END),
+                    // "voice ended" (NOTE_END — CLAP's cooperative voice-life
+                    // matching per clap/events.h lines 65-88), or "choke this
+                    // voice" (NOTE_CHOKE). We acknowledge the type to prevent
+                    // the default-drop, then log in JUCE_DEBUG for now. Real
+                    // voice-tracking wiring lands when VST L8ters implements
+                    // polyphonic modulation (v1.x — explicitly out of v1 per
+                    // PROJECT.md "Polyphonic modulation of hosted-plugin
+                    // parameters (physically impossible)" — but the SPEC-COMPLIANT
+                    // acknowledgement must be here from day one so the plugin
+                    // doesn't experience a silent drop).
+                    case CLAP_EVENT_NOTE_ON:
+                    case CLAP_EVENT_NOTE_OFF:
+                    case CLAP_EVENT_NOTE_CHOKE:
+                    case CLAP_EVENT_NOTE_END: {
+                       #if JUCE_DEBUG
+                        auto ev = reinterpret_cast<const clap_event_note*>(h);
+                        const char* kind = (h->type == CLAP_EVENT_NOTE_ON)    ? "NOTE_ON"
+                                         : (h->type == CLAP_EVENT_NOTE_OFF)   ? "NOTE_OFF"
+                                         : (h->type == CLAP_EVENT_NOTE_CHOKE) ? "NOTE_CHOKE"
+                                                                              : "NOTE_END";
+                        Logger::writeToLog (String ("[clap-host] ") + kind
+                                            + " key=" + String ((int) ev->key)
+                                            + " ch="  + String ((int) ev->channel)
+                                            + " vel=" + String (ev->velocity));
+                       #else
+                        (void) h;
+                       #endif
+                        break;
+                    }
+
+                    // Spike 001 priority-3: raw MIDI event echo from the plugin.
+                    // Plugins that implement clap_plugin_note_ports with
+                    // CLAP_NOTE_DIALECT_MIDI as an OUTPUT dialect emit these.
+                    // Acknowledge to avoid default-drop; forwarding MIDI out to
+                    // the DAW is IO-03's concern (Plan 03-07 wires the
+                    // juce::MidiBuffer -> DAW midiMessages pass-through).
+                    case CLAP_EVENT_MIDI: {
+                       #if JUCE_DEBUG
+                        auto ev = reinterpret_cast<const clap_event_midi*>(h);
+                        Logger::writeToLog (String ("[clap-host] MIDI raw=")
+                                            + String::toHexString ((int) ev->data[0]) + ","
+                                            + String::toHexString ((int) ev->data[1]) + ","
+                                            + String::toHexString ((int) ev->data[2]));
+                       #else
+                        (void) h;
+                       #endif
+                        break;
+                    }
+
+                    case CLAP_EVENT_MIDI_SYSEX:
+                    case CLAP_EVENT_MIDI2: {
+                        // Acknowledge to prevent default-drop. MIDI-sysex +
+                        // MIDI2 full forwarding is IO-03 scope (Plan 03-07).
+                        (void) h;
+                        break;
+                    }
+
+                    // Spike 001 priority-3: TRANSPORT event. Hosts normally
+                    // SEND transport info to the plugin (via clap_process.transport);
+                    // plugins MAY echo transport events on their output stream
+                    // to signal tempo-sensitive internal state changes. IO-05
+                    // (Plan 03-07) wires the AudioPlayHead::PositionInfo -> CLAP
+                    // transport translation on the INPUT side. Acknowledge on
+                    // the OUTPUT side here for spec completeness.
+                    case CLAP_EVENT_TRANSPORT: {
+                       #if JUCE_DEBUG
+                        auto ev = reinterpret_cast<const clap_event_transport*>(h);
+                        Logger::writeToLog (String ("[clap-host] TRANSPORT tempo=")
+                                            + String (ev->tempo)
+                                            + " flags=" + String ((int) ev->flags));
+                       #else
+                        (void) h;
+                       #endif
                         break;
                     }
 
@@ -828,8 +997,25 @@ namespace juce {
             return false;
         }
 
-        bool acceptsMidi() const override    { return false; /* hasMidiInput; */ }
-        bool producesMidi() const override   { return false; /* hasMidiOutput; */ }
+        // Spike 001 priority-3 (vst-l8ters Plan 03-04): report MIDI I/O based
+        // on the plugin's note_ports.count() result. Plugins that implement
+        // clap_plugin_note_ports with at least one input port accept MIDI;
+        // plugins with at least one output port produce MIDI. This is what
+        // the JUCE wrapper-side (DAW) uses to drive "is this plugin wired to
+        // MIDI?" affordances — without this, hosted CLAP instruments look
+        // like audio-only effects to the DAW.
+        bool acceptsMidi() const override
+        {
+            if (pluginNotePorts == nullptr || pluginNotePorts->count == nullptr)
+                return false;
+            return pluginNotePorts->count (plugin, /*is_input=*/true) > 0;
+        }
+        bool producesMidi() const override
+        {
+            if (pluginNotePorts == nullptr || pluginNotePorts->count == nullptr)
+                return false;
+            return pluginNotePorts->count (plugin, /*is_input=*/false) > 0;
+        }
 
         //==============================================================================
         AudioProcessorParameter* getBypassParameter() const override         { return nullptr; }
@@ -1181,6 +1367,28 @@ namespace juce {
 //            ignoreUnused (data, sizeInBytes);
 //        }
 
+    public:
+        //==============================================================================
+        // Spike 001 priority-3 (vst-l8ters Plan 03-04): public accessor for the
+        // plugin's input-event buffer. Unlocks the end-to-end TestCLAP PARAM_MOD
+        // audio roundtrip — ClapModulationEmitter (Source/Hosting/
+        // ClapModulationEmitter.cpp, Plan 03-03) pushes CLAP_EVENT_PARAM_MOD
+        // events INTO eventsIn via its clap_output_events_t* parameter. Without
+        // a public accessor, emitter callers had no way to hand the fork's
+        // eventsIn to emit() from OUR-side audio-thread code.
+        //
+        // Caller discipline:
+        //   - Audio thread ONLY. The underlying clap::helpers::EventList is
+        //     not thread-safe; the processBlock callback is the only valid
+        //     producer.
+        //   - Push BEFORE plugin->process runs (generatePluginInputEvents +
+        //     the MidiBuffer translation loop are the fork's existing producers;
+        //     add your events in the same window).
+        //   - eventsIn is cleared at the END of processBlock; events added
+        //     outside processBlock are silently discarded.
+        clap::helpers::EventList& getInputEventsList() noexcept { return eventsIn; }
+        const clap::helpers::EventList& getInputEventsList() const noexcept { return eventsIn; }
+
     private:
         clap_host host {};
         const clap_plugin *plugin = nullptr;
@@ -1190,6 +1398,11 @@ namespace juce {
         const clap_plugin_timer_support *pluginTimerSupport = nullptr;
         const clap_plugin_posix_fd_support *pluginPosixFdSupport = nullptr;
         const clap_plugin_state *pluginState = nullptr;
+        // Spike 001 priority-3 (vst-l8ters Plan 03-04): note-ports extension
+        // handle. Advertise-only — we don't currently query port count / info
+        // at host init time (the UI / IO-03 MidiRouter layer does that when it
+        // needs to surface a plugin's note-input ports to the user).
+        const clap_plugin_note_ports *pluginNotePorts = nullptr;
 
         bool isPluginActive { false };
         clap::helpers::EventList eventsIn;
