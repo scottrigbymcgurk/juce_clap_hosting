@@ -1,6 +1,17 @@
 #include "CLAPPluginFormat.h"
-#include "juce_audio_plugin_client/AU/CoreAudioUtilityClasses/CAXException.h" // CFBundleRef (there should be a better way...)
-#include "juce_core/native/juce_mac_CFHelpers.h" // CFUniquePtr
+
+// JUCE 8 no longer bundles CoreAudioUtilityClasses/CAXException.h (that was a
+// JUCE-7-era Apple header the fork pulled in only for CFBundleRef). In JUCE 8,
+// CFBundleRef is available directly from <CoreFoundation/CoreFoundation.h> on
+// macOS. juce_mac_CFHelpers.h was also renamed to juce_CFHelpers_mac.h in the
+// JUCE-8 native-file renaming pass (S5 convention: platform suffix trails).
+// Rule 3 build-fix per plan 03-00b deferred item "VSTL8TERS_CLAP_HOSTING_READY
+// flip requires fixing the fork's JUCE-7-era include path". Additive only —
+// no upstream symbol is renamed or removed.
+#if JUCE_MAC
+ #include <CoreFoundation/CoreFoundation.h> // CFBundleRef
+ #include "juce_core/native/juce_CFHelpers_mac.h" // CFUniquePtr (JUCE 8 filename)
+#endif
 
 #include <clap/clap.h>
 #include <clap/helpers/event-list.hh>
@@ -637,6 +648,45 @@ namespace juce {
                         v.has_value = true;
                         v.value = (float) ev->value;
                         pluginToHostParamQueue.setOrUpdate(ev->param_id, v);
+                        break;
+                    }
+
+                    case CLAP_EVENT_PARAM_MOD: {
+                        // Spike 001 priority-1 (~15 LOC): acknowledge
+                        // CLAP_EVENT_PARAM_MOD events coming out of the plugin so
+                        // the switch does not drop them into the implicit default
+                        // (silent drop).
+                        //
+                        // This is the D-15 NON-DESTRUCTIVE path — the event
+                        // indicates the plugin has observed a modulation amount
+                        // and is reporting it back (bypass/echo pattern). We do
+                        // NOT push this into pluginToHostParamQueue because
+                        // pluginToHostParamQueue is the destructive-value mirror
+                        // (AudioProcessorParameter::setValueWithoutUpdatingProcessor
+                        // path in timerCallback). Per the CLAP spec comment in
+                        // clap/events.h line 103-104, "The value heard is:
+                        // param_value + param_mod" — param_mod is a
+                        // superimposed offset, not a value replacement. Leaking
+                        // it into the JUCE parameter state would bake
+                        // modulation into the authoritative value, which is the
+                        // opposite of non-destructive.
+                        //
+                        // Acknowledging the case here is the minimum
+                        // additive change to stop the default drop. Host
+                        // -> plugin PARAM_MOD emission happens from VST
+                        // L8ters's own ClapModulationEmitter (our-side
+                        // glue; see Source/Hosting/ClapModulationEmitter.cpp)
+                        // and is fed into the plugin through eventsIn (the
+                        // processBlock-side input queue), independent of
+                        // this output-event switch.
+                       #if JUCE_DEBUG
+                        auto ev = reinterpret_cast<const clap_event_param_mod *>(h);
+                        Logger::writeToLog ("[clap-host] PARAM_MOD param_id="
+                                            + String ((int64) ev->param_id)
+                                            + " amount=" + String (ev->amount));
+                       #else
+                        (void) h;
+                       #endif
                         break;
                     }
                 }
