@@ -847,78 +847,221 @@ namespace juce {
         }
 
         //==============================================================================
-        AudioProcessorEditor* createEditor() override
+        // CLAP GUI host-side helpers — platform API + window-handle marshalling.
+        //
+        // Spike 001 priority-2 (~240 LOC budget) + spike 003 Pattern 1
+        // (probe-before-commit). Adds the full GUI lifecycle
+        // (is_api_supported → create → set_parent → get_size → show → destroy)
+        // on top of the existing pluginGui handle fetched in initialise()
+        // (line ~470). The fork previously returned a GenericAudioProcessorEditor
+        // DummyEditor; this replaces it with an embedded-plugin-native editor
+        // that delegates layout + lifetime to the CLAP plugin itself.
+        //
+        // Reference pedigree:
+        //   - clap/ext/gui.h lines 19-33 (lifecycle order) + lines 47-65 (API
+        //     constants) + lines 71-84 (clap_window + union fields per platform)
+        //   - spike 003 gui-probe.cpp lines 90-186 (probe handshake translated
+        //     verbatim; set_parent + show added for the "expensive version")
+        //   - Landmine 1 (Cardinal advertise-then-reject): probe-before-commit
+        //     handshake catches create() refusal gracefully — caller sees a
+        //     nullptr return and shows a disabled "Open window" UI affordance.
+        //   - macOS: CLAP_WINDOW_API_COCOA expects void* cocoa = NSView*.
+        //     JUCE's NSViewComponent is the embedding container; its
+        //     getWindowHandle() returns the underlying NSView* once the
+        //     component is peered (i.e. addToDesktop-ed). We use the AudioProcessor-
+        //     Editor's own peer handle (Component::getWindowHandle()) because
+        //     the editor IS the embedding parent (CLAP plugins are responsible
+        //     for creating their own NSView inside the parent we hand them via
+        //     set_parent). This matches the clap-host-demo pattern on macOS.
+        static const char* getCurrentClapGuiApi()
         {
-            auto getCurrentClapGuiApi = [] {
 #if JUCE_LINUX
-                return CLAP_WINDOW_API_X11;
+            return CLAP_WINDOW_API_X11;
 #elif JUCE_WINDOWS
-                return CLAP_WINDOW_API_WIN32;
+            return CLAP_WINDOW_API_WIN32;
 #elif JUCE_MAC
-                return CLAP_WINDOW_API_COCOA;
+            return CLAP_WINDOW_API_COCOA;
 #else
 #   error "unsupported platform"
 #endif
-            };
-
-            auto makeClapWindow = [] (Component& window) -> clap_window {
-                clap_window w;
-#if JUCE_LINUX
-                w.api = CLAP_WINDOW_API_X11;
-                w.x11 = window.getWindowHandle();
-#elif JUCE_MAC
-                w.api = CLAP_WINDOW_API_COCOA;
-                w.cocoa = reinterpret_cast<clap_nsview>(window.getWindowHandle());
-#elif JUCE_WINDOWS
-                w.api = CLAP_WINDOW_API_WIN32;
-                w.win32 = reinterpret_cast<clap_hwnd>(window.getWindowHandle());
-#endif
-                return w;
-            };
-
-//            if (! pluginGui->is_api_supported (plugin, getCurrentClapGuiApi(), false));
-//                return nullptr;
-//
-//            class Editor : public AudioProcessorEditor
-//            {
-//            public:
-//                explicit Editor (CLAPPluginInstance& plugin) : AudioProcessorEditor (plugin) {}
-//            };
-//
-//            auto* comp = new Editor { *this };
-//            auto w = makeClapWindow (*comp);
-//
-//            pluginGui->set_transient(plugin, &w);
-//            pluginGui->suggest_title(plugin, "using clap-host suggested title");
-//
-//            pluginGui->set_parent(plugin, &w);
-//
-//            return comp;
-            struct DummyEditor : GenericAudioProcessorEditor
-            {
-                explicit DummyEditor (AudioProcessor& p) : GenericAudioProcessorEditor (p) {}
-
-                ~DummyEditor() override
-                {
-                    getAudioProcessor()->editorBeingDeleted (this);
-                }
-            };
-
-            return new DummyEditor (*this); // @TODO
         }
 
-        bool hasEditor() const override
+        static clap_window makeClapWindow (Component& window)
+        {
+            clap_window w;
+#if JUCE_LINUX
+            w.api = CLAP_WINDOW_API_X11;
+            w.x11 = reinterpret_cast<clap_xwnd> (window.getWindowHandle());
+#elif JUCE_MAC
+            w.api = CLAP_WINDOW_API_COCOA;
+            w.cocoa = reinterpret_cast<clap_nsview> (window.getWindowHandle());
+#elif JUCE_WINDOWS
+            w.api = CLAP_WINDOW_API_WIN32;
+            w.win32 = reinterpret_cast<clap_hwnd> (window.getWindowHandle());
+#endif
+            return w;
+        }
+
+        //==============================================================================
+        // Probe-before-commit handshake (spike 003 Pattern 1).
+        //
+        // Walks the GUI extension's API surface far enough to confirm the
+        // plugin's create() will not refuse after advertising support
+        // (Cardinal-style advertise-then-reject). Runs create() + destroy()
+        // during probing — the CLAP spec allows create/destroy pairs; see
+        // clap/ext/gui.h lines 117-134 where create() is documented as
+        // allocating resources and destroy() as freeing them. The probe is
+        // thus a full round-trip, not a cheap capability check.
+        //
+        // Returns true if the plugin is ready to embed; false otherwise
+        // (caller returns nullptr from createEditor, and the rack UI shows
+        // a disabled "Open window" affordance per D-12 graceful-degrade).
+        bool probeGuiCapability()
         {
             if (pluginGui == nullptr)
                 return false;
 
-            return true;
-//            // (if possible, avoid creating a second instance of the editor, because that crashes some plugins)
-//            if (getActiveEditor() != nullptr)
-//                return true;
-//
-//            VSTComSmartPtr<IPlugView> view (tryCreatingView(), false);
-//            return view != nullptr;
+            const char* api = getCurrentClapGuiApi();
+            if (! pluginGui->is_api_supported (plugin, api, /*is_floating=*/false))
+                return false;
+
+            // create() is the load-bearing check (Landmine 1 Cardinal defence).
+            if (! pluginGui->create (plugin, api, /*is_floating=*/false))
+                return false;
+
+            // get_size is informational here (probe phase); it's re-read at
+            // commit time in createEditor(). An invalid size (0 or failure)
+            // after a successful create() is a pathological plugin — refuse.
+            uint32_t w = 0, h = 0;
+            const bool gotSize = pluginGui->get_size (plugin, &w, &h);
+            pluginGui->destroy (plugin);
+            return gotSize && w > 0 && h > 0;
+        }
+
+        AudioProcessorEditor* createEditor() override
+        {
+            if (pluginGui == nullptr)
+                return nullptr;
+
+            // Probe-before-commit: Cardinal-class plugins advertise support
+            // but refuse create(). Refusing to return a nullptr editor here
+            // lets the rack UI show a graceful "GUI unavailable" state
+            // instead of a live embedded view that fails to render.
+            if (! probeGuiCapability())
+                return nullptr;
+
+            // -----------------------------------------------------------------
+            // Embedded CLAP plugin editor. The plugin creates its own native
+            // view and parents it into OUR AudioProcessorEditor's window
+            // peer (Component::getWindowHandle()). The editor owns the CLAP
+            // create/destroy lifecycle; its dtor calls destroy() so the
+            // plugin's native resources are freed at the right moment.
+            // -----------------------------------------------------------------
+            struct EmbeddedClapEditor : public AudioProcessorEditor,
+                                        private ComponentMovementWatcher
+            {
+                EmbeddedClapEditor (CLAPPluginInstance& owner)
+                    : AudioProcessorEditor (owner)
+                    , ComponentMovementWatcher (this)
+                    , pluginOwner (owner)
+                    , gui (owner.pluginGui)
+                    , plugin (owner.plugin)
+                {
+                    setOpaque (true);
+                    // Addressable on Desktop is a prerequisite for getWindowHandle()
+                    // returning a real native handle; AudioProcessorEditor
+                    // lifecycle guarantees this via its host-side hosting
+                    // chain (RackChain / HostedPluginSlot in VST L8ters).
+
+                    // We re-create the GUI NOW — the probe's destroy() freed
+                    // its resources. create() must be called again before
+                    // set_parent/get_size/show.
+                    if (! gui->create (plugin, getCurrentClapGuiApi(), false))
+                    {
+                        guiCreated = false;
+                        return;
+                    }
+                    guiCreated = true;
+
+                    // Initial size from plugin.
+                    uint32_t w = 0, h = 0;
+                    if (gui->get_size (plugin, &w, &h) && w > 0 && h > 0)
+                        setSize ((int) w, (int) h);
+                    else
+                        setSize (400, 300); // conservative fallback
+
+                    // Parent: the CLAP plugin embeds its own native view
+                    // inside OUR window handle. set_parent is called AFTER
+                    // setSize + (eventual) addToDesktop; we trigger the
+                    // actual attach when the component becomes peered
+                    // (componentPeerChanged / parentHierarchyChanged).
+                }
+
+                ~EmbeddedClapEditor() override
+                {
+                    if (guiCreated && gui != nullptr && plugin != nullptr)
+                        gui->destroy (plugin);
+                    pluginOwner.editorBeingDeleted (this);
+                }
+
+                void paint (Graphics& g) override
+                {
+                    // The plugin paints over our backing view; fill with a
+                    // neutral background so JUCE's accessibility layer sees
+                    // a painted component even before the CLAP view attaches.
+                    g.fillAll (Colours::black);
+                }
+
+                // ComponentMovementWatcher hooks — set_parent once peered,
+                // and forward resizes to the plugin.
+                void componentMovedOrResized (bool /*wasMoved*/, bool wasResized) override
+                {
+                    if (wasResized && guiCreated && gui != nullptr && gui->set_size != nullptr)
+                        gui->set_size (plugin, (uint32_t) getWidth(), (uint32_t) getHeight());
+                }
+
+                void componentPeerChanged() override
+                {
+                    if (! guiCreated || gui == nullptr)
+                        return;
+                    if (getPeer() == nullptr)
+                        return; // component detached — plugin stays alive for reattach
+
+                    if (! parentAttached)
+                    {
+                        clap_window w = makeClapWindow (*this);
+                        if (gui->set_parent (plugin, &w))
+                        {
+                            parentAttached = true;
+                            if (gui->show != nullptr)
+                                gui->show (plugin);
+                        }
+                    }
+                }
+
+                void componentVisibilityChanged() override {}
+
+                CLAPPluginInstance&      pluginOwner;
+                const clap_plugin_gui*   gui { nullptr };
+                const clap_plugin*       plugin { nullptr };
+                bool                     guiCreated { false };
+                bool                     parentAttached { false };
+
+                JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (EmbeddedClapEditor)
+            };
+
+            return new EmbeddedClapEditor (*this);
+        }
+
+        bool hasEditor() const override
+        {
+            // Advertise hasEditor() based on pluginGui handle presence.
+            // The probe runs at createEditor() time (not here) because
+            // is_api_supported is cheap but create() is not. Hosts that
+            // call hasEditor() repeatedly (some do) get the cheap check;
+            // the load-bearing handshake only fires when the user actually
+            // requests the editor.
+            return pluginGui != nullptr;
         }
 
         //==============================================================================
