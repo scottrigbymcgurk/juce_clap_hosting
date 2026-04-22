@@ -1527,6 +1527,13 @@ namespace juce {
             // LatencySummer sees the change.
             if (!strcmp(extension, CLAP_EXT_LATENCY))
                 return &CLAPPluginInstance::hostLatency;
+            // vst-l8ters Plan 03-10 (D-19 CLAP side): expose host-side
+            // context-menu so hosted CLAP plugins can populate their
+            // parameter right-click menus against our placeholder.
+            // Phase 6 replaces the placeholder entry with the real
+            // modulator-picker; the vtable wiring stays stable.
+            if (!strcmp(extension, CLAP_EXT_CONTEXT_MENU))
+                return &CLAPPluginInstance::hostContextMenu;
             return nullptr;
         }
 
@@ -1627,6 +1634,83 @@ namespace juce {
 
         static const constexpr clap_host_latency hostLatency = {
                 CLAPPluginInstance::clapLatencyChanged,
+        };
+
+        // ------------------------------------------------------------------
+        // Context-menu host extension (vst-l8ters Plan 03-10, D-19 CLAP side).
+        // ------------------------------------------------------------------
+        //
+        // CLAP_EXT_CONTEXT_MENU (clap/ext/context-menu.h) is the CLAP
+        // counterpart to VST3's IComponentHandler3::createContextMenu. When a
+        // hosted CLAP plugin wants to offer a right-click context menu on a
+        // parameter, it asks the host to populate() additional items into the
+        // builder. Our host half returns a single disabled "coming soon"
+        // placeholder entry so VST L8ters Phase 6 can replace it with the
+        // real modulator-picker without touching the hosting layer.
+        //
+        // Placeholder parity: the label text MUST match ContextMenuHost.cpp's
+        // VST3 PlaceholderMenu ("Assign modulator (coming soon — Phase 6)"),
+        // enforced by vst-l8ters phase-3 quick.sh Section K grep parity check.
+        //
+        // T-3-10-02 mitigation: perform() returns false unconditionally in
+        // Phase 3 — no user-input handling. can_popup() + popup() return
+        // false; Phase 6 flips these to true when the UI layer gains the
+        // ability to host a top-level popup for CLAP plugins.
+        //
+        // Thread affinity: every callback is [main-thread] per
+        // clap/ext/context-menu.h. We match that contract — no audio-thread
+        // traffic, no RT_AUDIO_THREAD_ENTRY needed here.
+        static bool clapContextMenuPopulate (const clap_host_t*                 /*host*/,
+                                             const clap_context_menu_target_t*  /*target*/,
+                                             const clap_context_menu_builder_t* builder)
+        {
+            if (builder == nullptr || builder->add_item == nullptr)
+                return false;
+
+            clap_context_menu_entry entry {};
+            entry.label      = "Assign modulator (coming soon — Phase 6)";
+            entry.is_enabled = false;  // placeholder — not clickable in Phase 3
+            entry.action_id  = 0;
+
+            return builder->add_item (builder, CLAP_CONTEXT_MENU_ITEM_ENTRY, &entry);
+        }
+
+        static bool clapContextMenuPerform (const clap_host_t*                /*host*/,
+                                            const clap_context_menu_target_t* /*target*/,
+                                            clap_id                           /*action_id*/)
+        {
+            // Phase 3: placeholder has no clickable entries (is_enabled=false
+            // above), so perform() should never receive a live action_id.
+            // Defensive: refuse unconditionally. Phase 6 upgrades this branch
+            // alongside the real modulator-picker.
+            return false;
+        }
+
+        static bool clapContextMenuCanPopup (const clap_host_t* /*host*/)
+        {
+            // Phase 6 flips this to true once the rack can render a top-level
+            // popup against CLAP-embedded windows. For Phase 3 the
+            // context-menu hook is populate-only — the plugin can still
+            // display its own popup; we just can't host one yet.
+            return false;
+        }
+
+        static bool clapContextMenuPopup (const clap_host_t*                /*host*/,
+                                          const clap_context_menu_target_t* /*target*/,
+                                          int32_t                           /*screen_index*/,
+                                          int32_t                           /*x*/,
+                                          int32_t                           /*y*/)
+        {
+            // Paired with can_popup() above — return false until Phase 6 wires
+            // the host-side popup surface.
+            return false;
+        }
+
+        static const constexpr clap_host_context_menu hostContextMenu = {
+                CLAPPluginInstance::clapContextMenuPopulate,
+                CLAPPluginInstance::clapContextMenuPerform,
+                CLAPPluginInstance::clapContextMenuCanPopup,
+                CLAPPluginInstance::clapContextMenuPopup,
         };
 
         void refreshParameterList() override
