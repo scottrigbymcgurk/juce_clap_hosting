@@ -567,7 +567,17 @@ namespace juce {
             clap_audio_buffer clapBuffer {};
             clapBuffer.channel_count = (uint32_t) buffer.getNumChannels();
             clapBuffer.constant_mask = 0;
-            clapBuffer.data32 = buffer.getArrayOfWritePointers();
+            // JUCE 8 narrowed getArrayOfWritePointers to return `float* const*`
+            // (const pointer-to-pointer) where JUCE 7 returned `float**`. The
+            // CLAP C ABI's clap_audio_buffer::data32 is `float**`. We cast
+            // back to the mutable form — safe because JUCE's const-narrowing
+            // applies to the pointer-array itself, not the underlying
+            // channel-data buffers (CLAP is allowed to write into the
+            // per-channel buffers; it is NOT allowed to swap the per-channel
+            // pointers, which matches JUCE's invariant). [Rule 3 build-fix
+            // for JUCE 7 -> 8 drift — same category as the CFBundleRef
+            // include rename in Task 01.]
+            clapBuffer.data32 = const_cast<float**> (buffer.getArrayOfWritePointers());
             clapBuffer.data64 = nullptr;
             clapBuffer.latency = 0; // @TODO
 
