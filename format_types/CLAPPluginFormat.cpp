@@ -490,6 +490,13 @@ namespace juce {
             // plugin needs this extension initialised for the routing to
             // have a declared destination).
             initPluginExtension(pluginNotePorts, CLAP_EXT_NOTE_PORTS);
+            // Spike 001 priority-4 (vst-l8ters Plan 03-04): register
+            // CLAP_EXT_LATENCY so refreshLatencyFromPlugin() can read the
+            // hosted plugin's reported latency during prepareToPlay +
+            // latency-changed callbacks. Plan 03-08's LatencySummer sums
+            // CLAP-slot latencies alongside VST3/AU via JUCE's
+            // AudioPluginInstance::getLatencySamples() contract.
+            initPluginExtension(pluginLatency, CLAP_EXT_LATENCY);
 
             refreshParameterList();
 
@@ -550,6 +557,11 @@ namespace juce {
             plugin->activate (plugin, newSampleRate, 1, (uint32_t) estimatedSamplesPerBlock);
             isPluginActive = true;
             plugin->start_processing (plugin);
+
+            // Spike 001 priority-4 (vst-l8ters Plan 03-04): latency becomes
+            // valid to read once the plugin is activated (clap/ext/latency.h
+            // line 13 — [main-thread & (being-activated | active)]).
+            refreshLatencyFromPlugin();
         }
 
         void releaseResources() override
@@ -1021,6 +1033,42 @@ namespace juce {
         AudioProcessorParameter* getBypassParameter() const override         { return nullptr; }
 
         //==============================================================================
+        // Spike 001 priority-4 (vst-l8ters Plan 03-04, ~30 LOC): read the
+        // hosted CLAP plugin's latency in samples and push it to JUCE via
+        // AudioProcessor::setLatencySamples(). Plan 03-08's LatencySummer
+        // reads AudioPluginInstance::getLatencySamples() (the getter that
+        // returns whatever setLatencySamples() most recently set) and sums
+        // across slots (HOST-07). The rack adds NO latency of its own
+        // beyond what the hosted plugins introduce (HOST-08 / CLAUDE.md
+        // Architecture Invariant #5).
+        //
+        // Note: JUCE 8's AudioProcessor::getLatencySamples is NOT virtual
+        // (only setLatencySamples is callable-from-subclasses). So instead
+        // of overriding the getter, we push the plugin-reported value
+        // INTO JUCE's internal latency field via setLatencySamples(). Read
+        // once at prepareToPlay() and again when the plugin signals a
+        // latency change via host->clap_host_latency.changed().
+        //
+        // Thread affinity: clap_plugin_latency.get() is [main-thread &
+        // (being-activated | active)] per clap/ext/latency.h line 13.
+        // prepareToPlay runs on the message thread (JUCE host contract);
+        // clapLatencyChanged marshals to the message thread via callAsync.
+        //
+        // T-3-04-02 (Tampering): plugin returns uint32_t > INT_MAX. Clamp
+        // to INT_MAX before the narrowing cast.
+        void refreshLatencyFromPlugin()
+        {
+            if (pluginLatency == nullptr || pluginLatency->get == nullptr)
+            {
+                setLatencySamples (0);  // no latency extension → spec default
+                return;
+            }
+            const uint32_t reported = pluginLatency->get (plugin);
+            const auto clamped = juce::jmin (reported, (uint32_t) std::numeric_limits<int>::max());
+            setLatencySamples (static_cast<int> (clamped));
+        }
+
+        //==============================================================================
         /** May return a negative value as a means of informing us that the plugin has "infinite tail," or 0 for "no tail." */
         double getTailLengthSeconds() const override
         {
@@ -1403,6 +1451,10 @@ namespace juce {
         // at host init time (the UI / IO-03 MidiRouter layer does that when it
         // needs to surface a plugin's note-input ports to the user).
         const clap_plugin_note_ports *pluginNotePorts = nullptr;
+        // Spike 001 priority-4 (vst-l8ters Plan 03-04): latency extension
+        // handle. Read from refreshLatencyFromPlugin(); Plan 03-08's
+        // LatencySummer sums across slots.
+        const clap_plugin_latency *pluginLatency = nullptr;
 
         bool isPluginActive { false };
         clap::helpers::EventList eventsIn;
@@ -1467,31 +1519,114 @@ namespace juce {
                 return &CLAPPluginInstance::hostParams;
             if (!strcmp(extension, CLAP_EXT_STATE))
                 return &CLAPPluginInstance::hostState;
+            // Spike 001 priority-4 (vst-l8ters Plan 03-04): host-side latency
+            // extension. Plugin invokes host->clap_host_latency.changed()
+            // when its reported latency changes; we schedule an async
+            // updateHostDisplay({.latencyChanged=true}) on the message
+            // thread via JUCE's AudioProcessorListener path so Plan 03-08's
+            // LatencySummer sees the change.
+            if (!strcmp(extension, CLAP_EXT_LATENCY))
+                return &CLAPPluginInstance::hostLatency;
             return nullptr;
         }
 
         /* clap host callbacks */
+        // Spike 001 priority-5 (vst-l8ters Plan 03-04, ~40 LOC): log hook with
+        // token-bucket rate limiting to defuse T-3-04-01 (misbehaving plugin
+        // spams clap_host_log).
+        //
+        // Rate-limit: a process-wide atomic token bucket seeded at 100 tokens
+        // per refill interval (1 second). Each call decrements by fetch_sub;
+        // when depleted, messages are dropped silently. Refill happens
+        // lazily inside the log function itself — the first call in a new
+        // 1-second window resets tokensThisSecond back to 100. No timer
+        // thread needed; no allocation; no locks (atomic CAS on the refill
+        // timestamp + atomic fetch_sub on the token counter).
+        //
+        // Severity: map CLAP severities to a prefix string so downstream
+        // log consumers can filter by level. juce::Logger::writeToLog is
+        // the JUCE 8 canonical log sink; CLAP's log is documented
+        // [thread-safe] per clap/ext/log.h line 28.
         static void clapLog(const clap_host *host, clap_log_severity severity, const char *msg)
         {
             ignoreUnused (host);
+            if (msg == nullptr) return;
 
-            switch (severity) {
-                case CLAP_LOG_DEBUG:
-                case CLAP_LOG_INFO:
-                case CLAP_LOG_WARNING:
-                case CLAP_LOG_ERROR:
-                case CLAP_LOG_FATAL:
-                case CLAP_LOG_HOST_MISBEHAVING:
-                default:
-                    Logger::writeToLog (msg);
-                    break;
+            // Token-bucket refill. Coarse: one process-wide bucket shared across
+            // all hosted CLAP plugins. Per-plugin rate-limits are a v1.x
+            // refinement if field usage shows cross-plugin log starvation.
+            static std::atomic<int>        tokensThisSecond { 100 };
+            static std::atomic<juce::int64> nextRefillMs     { 0 };
+
+            const auto nowMs = Time::getMillisecondCounter();
+            auto refillAt = nextRefillMs.load (std::memory_order_relaxed);
+            if ((juce::int64) nowMs >= refillAt)
+            {
+                // First call in a new 1-second window — reset the bucket. CAS
+                // to avoid a thundering-herd race between plugins logging in
+                // quick succession on different threads.
+                const juce::int64 next = (juce::int64) nowMs + 1000;
+                if (nextRefillMs.compare_exchange_strong (refillAt, next,
+                                                          std::memory_order_relaxed))
+                    tokensThisSecond.store (100, std::memory_order_relaxed);
             }
+
+            if (tokensThisSecond.fetch_sub (1, std::memory_order_relaxed) <= 0)
+                return;  // bucket depleted — drop silently
+
+            const char* sevStr = (severity == CLAP_LOG_ERROR)            ? "ERROR"
+                               : (severity == CLAP_LOG_FATAL)            ? "FATAL"
+                               : (severity == CLAP_LOG_WARNING)          ? "WARN"
+                               : (severity == CLAP_LOG_INFO)             ? "INFO"
+                               : (severity == CLAP_LOG_DEBUG)            ? "DEBUG"
+                               : (severity == CLAP_LOG_HOST_MISBEHAVING) ? "HOST-MISBEHAVING"
+                               : (severity == CLAP_LOG_PLUGIN_MISBEHAVING) ? "PLUGIN-MISBEHAVING"
+                                                                           : "LOG";
+            Logger::writeToLog (String ("[clap-host ") + sevStr + "] " + msg);
         }
 
         std::map<clap_id, CLAPParameter*> paramMap {};
         clap_param_rescan_flags paramRescanFlags { CLAP_INVALID_ID };
         static const constexpr clap_host_log hostLog = {
                 CLAPPluginInstance::clapLog,
+        };
+
+        // Spike 001 priority-4 (vst-l8ters Plan 03-04): host-side latency
+        // extension vtable + callback. When the hosted CLAP plugin's latency
+        // changes during activation, it calls
+        // host->get_extension(CLAP_EXT_LATENCY)->changed() — we catch the
+        // change here, refresh the plugin-reported value into JUCE's internal
+        // latency field (setLatencySamples via refreshLatencyFromPlugin),
+        // then notify listeners via updateHostDisplay(latencyChanged=true).
+        // Plan 03-08's LatencySummer is a listener and recomputes the rack's
+        // total reported latency on that notification.
+        //
+        // Thread affinity: clap_host_latency.changed is [main-thread &
+        // being-activated] per clap/ext/latency.h line 20. We forward via
+        // juce::MessageManager::callAsync so the actual JUCE listener
+        // dispatch always runs on the JUCE message thread, regardless of
+        // whether the plugin misbehaves and calls ->changed() from some
+        // other thread (defensive).
+        //
+        // T-3-04-03 (DoS): plugin triggers latency_changed in a tight loop.
+        // callAsync coalesces in practice because JUCE's AsyncUpdater
+        // pattern dedupes pending posts; audioProcessorChanged further
+        // dedupes identical latency values (listener implementations
+        // check delta before acting).
+        static void clapLatencyChanged (const clap_host* host)
+        {
+            auto* self = fromHost (host);
+            MessageManager::callAsync ([self]()
+            {
+                if (self == nullptr) return;
+                self->refreshLatencyFromPlugin();
+                self->updateHostDisplay (
+                    AudioPluginInstance::ChangeDetails{}.withLatencyChanged (true));
+            });
+        }
+
+        static const constexpr clap_host_latency hostLatency = {
+                CLAPPluginInstance::clapLatencyChanged,
         };
 
         void refreshParameterList() override
